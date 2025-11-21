@@ -12,7 +12,7 @@ class FeatCaptionDataset(Dataset):
         "labels":      LongTensor   [L]  (-100 on pads)
       }
     """
-    def __init__(self, jsonl_path, tokenizer, max_len=64, shard_cache_size=2):
+    def __init__(self, jsonl_path, tokenizer, max_len=32, shard_cache_size=2):
         assert os.path.isfile(jsonl_path), f"Missing {jsonl_path}"
         self.tok = tokenizer
         self.max_len = int(max_len)
@@ -105,8 +105,10 @@ class FeatCaptionDataset(Dataset):
         labels[attention_mask == 0] = -100
 
         return {
-            "patch_tokens": toks,         
-            "input_ids": input_ids,       
-            "attention_mask": attention_mask, 
-            "labels": labels,             
+            "patch_tokens": toks,
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+            "caption": r["caption"],  
         }
+
