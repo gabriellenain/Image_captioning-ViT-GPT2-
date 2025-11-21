@@ -1,246 +1,373 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import GPT2LMHeadModel
-import re
+from dataclasses import dataclass
 
-class GPT2SelfAttention(nn.Module):
-    def __init__(self, d, n_heads, drop=0.1):
+class CausalSelfAttention(nn.Module):
+    def __init__(self, config):
         super().__init__()
-        assert d % n_heads == 0
-        self.d, self.h, self.dh = d, n_heads, d // n_heads
-        self.c_attn = nn.Linear(d, 3 * d)
-        self.c_proj = nn.Linear(d, d)
-        self.drop = nn.Dropout(drop)
+        assert config.n_embd % config.n_head == 0
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
 
     def forward(self, x):
-        B, T, C = x.shape
+        B, T, C = x.size()
         qkv = self.c_attn(x)
-        q, k, v = qkv.split(C, dim=-1)
-        q = q.view(B, T, self.h, self.dh).transpose(1, 2)
-        k = k.view(B, T, self.h, self.dh).transpose(1, 2)
-        v = v.view(B, T, self.h, self.dh).transpose(1, 2)
+        q, k, v = qkv.split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
-        return self.drop(self.c_proj(y))   
+        y = self.c_proj(y)
+        return y
 
-
-class GPT2CrossAttention(nn.Module):
-    def __init__(self, d, n_heads, drop=0.1):
+class MLP(nn.Module):
+    def __init__(self, config):
         super().__init__()
-        assert d % n_heads == 0
-        self.d, self.h, self.dh = d, n_heads, d // n_heads
-        self.q = nn.Linear(d, d)
-        self.k = nn.Linear(d, d)
-        self.v = nn.Linear(d, d)
-        self.o = nn.Linear(d, d)
-        self.drop = nn.Dropout(drop)
-
-    def forward(self, txt, img):
-        B, T, C = txt.shape
-        q = self.q(txt).view(B, T, self.h, self.dh).transpose(1, 2)
-        k = self.k(img).view(B, -1, self.h, self.dh).transpose(1, 2)
-        v = self.v(img).view(B, -1, self.h, self.dh).transpose(1, 2)
-        att = (q @ k.transpose(-2, -1)) * (self.dh ** -0.5)
-        att = att.softmax(dim=-1)
-        y = att @ v
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        return self.drop(self.o(y))    
-
-
-class GPT2MLP(nn.Module):
-    def __init__(self, d, mlp_ratio=4, drop=0.1):
-        super().__init__()
-        self.fc = nn.Linear(d, mlp_ratio * d)
-        self.proj = nn.Linear(mlp_ratio * d, d)
-        self.drop = nn.Dropout(drop)
+        self.c_fc   = nn.Linear(config.n_embd, 4 * config.n_embd)
+        self.gelu   = nn.GELU(approximate='tanh')
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
-        return self.drop(self.proj(F.gelu(self.fc(x))))  
+        x = self.c_fc(x)
+        x = self.gelu(x)
+        x = self.c_proj(x)
+        return x
+
+class Block(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(config.n_embd)
+        self.attn = CausalSelfAttention(config)
+        self.ln_2 = nn.LayerNorm(config.n_embd)
+        self.mlp  = MLP(config)
+
+    def forward(self, x):
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
+        return x
+
+@dataclass
+class GPTConfig:
+    block_size: int = 1024
+    vocab_size: int = 50257
+    n_layer: int = 12
+    n_head: int = 12
+    n_embd: int = 768
 
 
-class VisionBlock(nn.Module):
-    """Self-attn → Cross-attn → MLP with pre-LN and residuals (GPT-2 style order)."""
+class GPT(nn.Module):
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+        self.config = config
+
+        self.transformer = nn.ModuleDict(dict(
+            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            wpe = nn.Embedding(config.block_size, config.n_embd),
+            h   = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            ln_f = nn.LayerNorm(config.n_embd),
+        ))
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.transformer.wte.weight = self.lm_head.weight  # weight tying
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                std *= (2 * self.config.n_layer) ** -0.5
+            nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, idx, targets=None):
+        B, T = idx.size()
+        assert T <= self.config.block_size
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
+        pos_emb = self.transformer.wpe(pos)      
+        tok_emb = self.transformer.wte(idx)     
+        x = tok_emb + pos_emb                   
+        for block in self.transformer.h:
+            x = block(x)
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)                 
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1)
+            )
+        return logits, loss
+
+def load_nanogpt_from_ckpt(ckpt_path: str, map_location="cpu") -> GPT:
+    raw = torch.load(ckpt_path, map_location=map_location)
+    if isinstance(raw, dict) and "model" in raw and "config" in raw:
+        sd = raw["model"]
+        cfg = raw["config"]
+        print(f"[NanoGPT] Loaded checkpoint {ckpt_path} "
+              f"(step={raw.get('step','?')}, val_loss={raw.get('val_loss','?')})")
+    else:
+        sd = raw
+        cfg = GPTConfig(vocab_size=50304)  # ton cas
+        print(f"[NanoGPT] Loaded flat state_dict from {ckpt_path}")
+
+    gpt = GPT(cfg)
+    gpt.load_state_dict(sd, strict=True)
+    return gpt
+
+class QFormerLayer(nn.Module):
+    """
+    Un bloc de Q-Former :
+      - self-attention sur les queries
+      - cross-attention queries -> vision features
+      - MLP
+    """
     def __init__(self, d, n_heads, drop=0.1):
         super().__init__()
         self.ln1 = nn.LayerNorm(d)
-        self.sa = GPT2SelfAttention(d, n_heads, drop)
-        self.ln2 = nn.LayerNorm(d)
-        self.ca = GPT2CrossAttention(d, n_heads, drop)
+        self.self_attn = nn.MultiheadAttention(d, n_heads, dropout=drop, batch_first=True)
+
+        self.ln2_q = nn.LayerNorm(d)
+        self.ln2_v = nn.LayerNorm(d)
+        self.cross_attn = nn.MultiheadAttention(d, n_heads, dropout=drop, batch_first=True)
+
         self.ln3 = nn.LayerNorm(d)
-        self.mlp = GPT2MLP(d, drop=drop)
+        self.mlp = nn.Sequential(
+            nn.Linear(d, 4 * d),
+            nn.GELU(),
+            nn.Linear(4 * d, d),
+        )
         self.drop = nn.Dropout(drop)
 
-    def forward(self, x, img_mem):
-        x = x + self.drop(self.sa(self.ln1(x)))
-        x = x + self.drop(self.ca(self.ln2(x), img_mem))
-        x = x + self.drop(self.mlp(self.ln3(x)))
-        return x
-        
-def _safe_load(path):
-    try:
-        return torch.load(path, map_location="cpu", weights_only=True)
-    except TypeError: 
-        return torch.load(path, map_location="cpu")
+    def forward(self, q, v):
+        q2 = self.ln1(q)
+        sa_out, _ = self.self_attn(q2, q2, q2)
+        q = q + self.drop(sa_out)
 
-def _flat_sd(obj):
-    if hasattr(obj, "state_dict"):
-        obj = obj.state_dict()
-    elif isinstance(obj, dict) and "state_dict" in obj:
-        obj = obj["state_dict"]
-    elif isinstance(obj, dict) and "model" in obj and hasattr(obj["model"], "state_dict"):
-        obj = obj["model"].state_dict()
-    elif not isinstance(obj, dict):
-        raise RuntimeError("Unsupported checkpoint object")
-    return {k.replace("module.", ""): v for k, v in obj.items()}
+        q2 = self.ln2_q(q)
+        v2 = self.ln2_v(v)
+        ca_out, _ = self.cross_attn(q2, v2, v2)
+        q = q + self.drop(ca_out)
 
-def _get_any(sd, names):
-    for n in names:
-        if n in sd:
-            return sd[n]
-    for k in sd:
-        if any(k.endswith(n) for n in names):
-            return sd[k]
-    ks = list(sd.keys())
-    raise KeyError(f"None of {names} found. Sample keys: {ks[:12]} ... (total {len(ks)})")
+        q2 = self.ln3(q)
+        q = q + self.drop(self.mlp(q2))
+        return q
 
-def _infer_cfg(sd):
-    wte = _get_any(sd, ("transformer.wte.weight", "wte.weight"))
-    wpe = _get_any(sd, ("transformer.wpe.weight", "wpe.weight"))
-    V, d = wte.shape
-    block_size = wpe.shape[0]
+class BLIP2Bridge(nn.Module):
+    """
+    Bridge BLIP-2 :
+      - projette enc_dim -> d_lm
+      - M queries apprenables
+      - L couches de Q-Former
+    Sortie : (B, M, d_lm) = M pseudo-tokens image dans l'espace du LM.
+    """
+    def __init__(self, enc_dim, d_lm, n_heads, n_queries=8, n_layers=2, drop=0.1):
+        super().__init__()
+        self.vis_proj = nn.Linear(enc_dim, d_lm)
+        self.n_queries = n_queries
+        self.query_tokens = nn.Parameter(torch.randn(n_queries, d_lm))
 
-    L = 0
-    pat = re.compile(r"(?:^|.*\.)h\.(\d+)\.")
-    for k in sd.keys():
-        m = pat.match(k)
-        if m:
-            L = max(L, int(m.group(1)) + 1)
+        self.layers = nn.ModuleList(
+            [QFormerLayer(d_lm, n_heads, drop=drop) for _ in range(n_layers)]
+        )
 
-    H = 12  
-    return dict(vocab_size=V, n_embd=d, n_layer=L, n_head=H, block_size=block_size)
+    def forward(self, patch_tokens):
+        x = self.vis_proj(patch_tokens)  
+        B, N, D = x.shape
 
-def _copy_linear(dst, src):
-    with torch.no_grad():
-        if src.weight.shape == dst.weight.shape: dst.weight.copy_(src.weight)
-        elif src.weight.T.shape == dst.weight.shape: dst.weight.copy_(src.weight.T)
-        else: raise RuntimeError("shape mismatch in linear copy")
-        if dst.bias is not None and src.bias is not None:
-            dst.bias.copy_(src.bias)
+        q = self.query_tokens.unsqueeze(0).expand(B, -1, -1)
 
-class CaptionGPT2(nn.Module):
-    def __init__(self, enc_dim, tokenizer, gpt_name="gpt2", freeze_lm=True, custom_ckpt=None):
+        for layer in self.layers:
+            q = layer(q, x)  
+
+        return q  
+
+class CaptionNanoGPT(nn.Module):
+    """
+    - patch_tokens : (B, N_img, enc_dim) venant de CLIP (gelé)
+    - Bridge BLIP-2 (Q-Former light) -> M pseudo-tokens image en dim n_embd
+    - NanoGPT (gelé) prend [image_prefix, texte] via embeddings + wpe
+    """
+
+    def __init__(
+        self,
+        enc_dim: int,
+        tokenizer,          
+        custom_ckpt: str,
+        m_vis_tokens: int = 32,
+        use_cls_only: bool = False,
+        freeze_lm: bool = True,
+    ):
         super().__init__()
         self.tokenizer = tokenizer
+        self.use_cls_only = use_cls_only
 
-        if custom_ckpt is None:
-            base = GPT2LMHeadModel.from_pretrained(gpt_name)
-            cfg = base.config
-            d, L, H, V = cfg.n_embd, cfg.n_layer, cfg.n_head, cfg.vocab_size
-            self.block_size = cfg.n_positions
-        else:
-            sd = _flat_sd(_safe_load(custom_ckpt))
-            cfg = _infer_cfg(sd)
-            d, L, H, V = cfg["n_embd"], cfg["n_layer"], cfg["n_head"], cfg["vocab_size"]
-            self.block_size = cfg["block_size"]
+        self.gpt = load_nanogpt_from_ckpt(custom_ckpt)
+        cfg = self.gpt.config
+        self.d = cfg.n_embd
+        self.block_size = cfg.block_size
 
-        self.wte = nn.Embedding(V, d)
-        self.wpe = nn.Embedding(self.block_size, d)
-        self.blocks = nn.ModuleList([VisionBlock(d, H) for _ in range(L)])
-        self.ln_f = nn.LayerNorm(d)
-        self.lm_head = nn.Linear(d, V, bias=False)
-        self.lm_head.weight = self.wte.weight 
-        self.img_proj = nn.Linear(enc_dim, d)
+        self.bridge = BLIP2Bridge(
+            enc_dim=enc_dim,
+            d_lm=self.d,
+            n_heads=cfg.n_head,
+            n_queries=m_vis_tokens,
+            n_layers=2,
+            drop=0.1,
+        )
 
-        with torch.no_grad():
-            if custom_ckpt is None:
-                base = GPT2LMHeadModel.from_pretrained(gpt_name)
-                self.wte.weight.copy_(base.transformer.wte.weight)
-                self.wpe.weight.copy_(base.transformer.wpe.weight)
-                self.ln_f.weight.copy_(base.transformer.ln_f.weight)
-                self.ln_f.bias.copy_(base.transformer.ln_f.bias)
-                for i, blk in enumerate(self.blocks):
-                    ref = base.transformer.h[i]
-                    blk.ln1.weight.copy_(ref.ln_1.weight); blk.ln1.bias.copy_(ref.ln_1.bias)
-                    blk.ln3.weight.copy_(ref.ln_2.weight); blk.ln3.bias.copy_(ref.ln_2.bias)
-                    _copy_linear(blk.sa.c_attn, ref.attn.c_attn); _copy_linear(blk.sa.c_proj, ref.attn.c_proj)
-                    _copy_linear(blk.mlp.fc, ref.mlp.c_fc);      _copy_linear(blk.mlp.proj, ref.mlp.c_proj)
-            else:
-                sd = _flat_sd(_safe_load(custom_ckpt))
-                self.wte.weight.copy_(_get_any(sd, ("transformer.wte.weight", "wte.weight")))
-                self.wpe.weight.copy_(_get_any(sd, ("transformer.wpe.weight", "wpe.weight")))
-                self.ln_f.weight.copy_(_get_any(sd, ("transformer.ln_f.weight", "ln_f.weight")))
-                self.ln_f.bias.copy_(_get_any(sd, ("transformer.ln_f.bias",   "ln_f.bias")))
-                for i, blk in enumerate(self.blocks):
-                    blk.ln1.weight.copy_(sd[f"transformer.h.{i}.ln_1.weight"]); blk.ln1.bias.copy_(sd[f"transformer.h.{i}.ln_1.bias"])
-                    blk.ln3.weight.copy_(sd[f"transformer.h.{i}.ln_2.weight"]); blk.ln3.bias.copy_(sd[f"transformer.h.{i}.ln_2.bias"])
-                    blk.sa.c_attn.weight.copy_(sd[f"transformer.h.{i}.attn.c_attn.weight"]); blk.sa.c_attn.bias.copy_(sd[f"transformer.h.{i}.attn.c_attn.bias"])
-                    blk.sa.c_proj.weight.copy_(sd[f"transformer.h.{i}.attn.c_proj.weight"]);   blk.sa.c_proj.bias.copy_(sd[f"transformer.h.{i}.attn.c_proj.bias"])
-                    blk.mlp.fc.weight.copy_(sd[f"transformer.h.{i}.mlp.c_fc.weight"]);         blk.mlp.fc.bias.copy_(sd[f"transformer.h.{i}.mlp.c_fc.bias"])
-                    blk.mlp.proj.weight.copy_(sd[f"transformer.h.{i}.mlp.c_proj.weight"]);     blk.mlp.proj.bias.copy_(sd[f"transformer.h.{i}.mlp.c_proj.bias"])
+        self.wte = self.gpt.transformer.wte
+        self.wpe = self.gpt.transformer.wpe
 
         if freeze_lm:
-            for p in self.parameters(): p.requires_grad_(False)
-            for p in self.img_proj.parameters(): p.requires_grad_(True)
-            for blk in self.blocks:
-                for p in blk.ca.parameters():  p.requires_grad_(True)
-                for p in blk.ln2.parameters(): p.requires_grad_(True)
+            for p in self.gpt.parameters():
+                p.requires_grad_(False)
+        for p in self.bridge.parameters():
+            p.requires_grad_(True)
+
+    def _decode_transformer(self, full_embeds):
+        """Passe les embeddings (B, L, d) dans les blocs GPT."""
+        x = full_embeds
+        for block in self.gpt.transformer.h:
+            x = block(x)
+        x = self.gpt.transformer.ln_f(x)
+        logits = self.gpt.lm_head(x)
+        return logits
 
     def forward(self, patch_tokens, input_ids, labels=None):
         """
-        patch_tokens: (B, N_img, D_enc)
-        input_ids:    (B, T_txt)
+        patch_tokens : (B, N_img, enc_dim)
+        input_ids    : (B, T_txt)
+        labels       : (B, T_txt) (-100 sur pads)
         """
-        B, T = input_ids.shape
+        B, T_txt = input_ids.shape
         device = input_ids.device
 
-        img_mem = self.img_proj(patch_tokens)               
-        pos = torch.arange(T, device=device).long()
-        x = self.wte(input_ids) + self.wpe(pos)[None, :, :]   
+        if patch_tokens.dim() == 2:
+            patch_tokens = patch_tokens.unsqueeze(1)
+        B_img, N_raw, D_enc = patch_tokens.shape
+        assert B_img == B, "batch size image != batch size texte"
 
-        for blk in self.blocks:
-            x = blk(x, img_mem)
+        x_img = patch_tokens
+        if self.use_cls_only:
+            x_img = x_img[:, 0:1, :]
 
-        x = self.ln_f(x)
-        logits = self.lm_head(x)
+        img_embeds = self.bridge(x_img)
+        M = img_embeds.size(1)
+
+        txt_embeds = self.wte(input_ids)
+
+        full_len = M + T_txt
+        if full_len > self.block_size:
+            cut_txt = self.block_size - M
+            txt_embeds = txt_embeds[:, :cut_txt, :]
+            input_ids = input_ids[:, :cut_txt]
+            if labels is not None:
+                labels = labels[:, :cut_txt]
+            T_txt = cut_txt
+            full_len = M + T_txt
+
+        pos = torch.arange(full_len, device=device)
+        pos_embeds = self.wpe(pos).unsqueeze(0)     
+
+        full_embeds = torch.cat([img_embeds, txt_embeds], dim=1)  
+        full_embeds = full_embeds + pos_embeds
+
+        logits = self._decode_transformer(full_embeds)
 
         loss = None
         if labels is not None:
-            V = logits.size(-1)
-            logits_shift = logits[:, :-1, :].contiguous()
-            labels_shift = labels[:, 1:].contiguous()
+            logits_text = logits[:, M:M+T_txt, :]
+
+            shift_logits = logits_text[:, :-1, :].contiguous() 
+            shift_labels = labels[:, 1:].contiguous()          
+
             loss = F.cross_entropy(
-                logits_shift.view(-1, V),
-                labels_shift.view(-1),
-                ignore_index=-100,
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100, 
             )
 
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, patch_tokens, prompt_ids, max_new_tokens=32, temperature=0.8, top_p=0.95):
+    def generate(
+        self,
+        patch_tokens,
+        prompt_ids,
+        max_new_tokens: int = 32,
+        temperature: float = 0.8,
+        top_p: float = 0.95,
+    ):
+        """
+        Génération auto-régressive avec NanoGPT + prefix image.
+        """
+        self.gpt.eval()
+        device = prompt_ids.device
+        B = patch_tokens.size(0)
+
+        if patch_tokens.dim() == 2:
+            patch_tokens = patch_tokens.unsqueeze(1)
+        B_img, N_raw, D_enc = patch_tokens.shape
+        assert B_img == B
+
+        x_img = patch_tokens
+        if self.use_cls_only:
+            x_img = x_img[:, 0:1, :]
+
+        img_embeds = self.bridge(x_img)
+        M = img_embeds.size(1)
+
         seq = prompt_ids.clone()
+
         for _ in range(max_new_tokens):
-            ctx = seq[:, -self.block_size:] if seq.size(1) > self.block_size else seq
-            logits, _ = self.forward(patch_tokens, ctx)
+            T_txt = seq.size(1)
+            full_len = M + T_txt
+            if full_len > self.block_size:
+                cut_txt = self.block_size - M
+                seq_ctx = seq[:, -cut_txt:]
+                T_txt = cut_txt
+            else:
+                seq_ctx = seq
+
+            txt_embeds = self.wte(seq_ctx) 
+            L = M + T_txt
+            pos = torch.arange(L, device=device)
+            pos_embeds = self.wpe(pos).unsqueeze(0)  
+
+            full_embeds = torch.cat([img_embeds, txt_embeds], dim=1)
+            full_embeds = full_embeds + pos_embeds
+
+            logits = self._decode_transformer(full_embeds)
             next_logits = logits[:, -1, :] / max(temperature, 1e-8)
-            probs = next_logits.softmax(-1)
+            probs = next_logits.softmax(dim=-1)
 
             if top_p < 1.0:
                 sorted_p, sorted_idx = probs.sort(dim=-1, descending=True)
                 cumsum = sorted_p.cumsum(dim=-1)
-                cut = (cumsum > top_p).float().argmax(dim=-1).clamp_min(1)
-                idx_next = []
-                for b in range(probs.size(0)):
-                    k = int(cut[b].item())
+                cutoff = (cumsum > top_p).float().argmax(dim=-1).clamp_min(1)
+                next_tok = []
+                for b in range(B):
+                    k = int(cutoff[b].item())
                     keep = sorted_idx[b, :k]
-                    p = probs[b, keep]; p = p / p.sum()
-                    idx_next.append(keep[torch.multinomial(p, 1)])
-                next_tok = torch.stack(idx_next, dim=0)
+                    p = probs[b, keep]
+                    p = p / p.sum()
+                    next_tok.append(keep[torch.multinomial(p, 1)])
+                next_tok = torch.stack(next_tok, dim=0)
             else:
                 next_tok = torch.multinomial(probs, num_samples=1)
 
             seq = torch.cat([seq, next_tok], dim=1)
             if (next_tok.squeeze(1) == self.tokenizer.eos_token_id).all():
                 break
+
         return self.tokenizer.batch_decode(seq, skip_special_tokens=True)
+
